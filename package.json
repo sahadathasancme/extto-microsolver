@@ -1,0 +1,1 @@
+{"dependencies":{"puppeteer-core":"^23.0.0"},"description":"Single-process, single-request Chromium solver for 512 MB hosts (FlareSolverr-compatible /v1)","main":"server.js","name":"extto-microsolver","private":true,"scripts":{"start":"node server.js"},"version":"1.0.0"}
