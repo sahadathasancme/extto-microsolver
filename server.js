@@ -20,6 +20,8 @@ const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 
 let busy = false;
+// Last solve outcome, kept so a client that disconnects can still read the result via /last.
+let last = null;
 
 function memMB() {
   const u = process.memoryUsage();
@@ -27,6 +29,12 @@ function memMB() {
 }
 
 async function solve(url, maxTimeout) {
+  const started = Date.now();
+  // One deadline for the WHOLE solve (launch + goto + challenge wait). The first version
+  // stacked goto's timeout on top of the wait timeout, so a slow 0.1-vCPU solve could run
+  // past the client's timeout and its result was lost even though the server later cleared.
+  const deadline = started + maxTimeout;
+  const remaining = () => Math.max(0, deadline - Date.now());
   const browser = await puppeteer.launch({
     executablePath: CHROME,
     headless: "new",
@@ -56,10 +64,9 @@ async function solve(url, maxTimeout) {
       if (["image", "font", "media", "stylesheet"].includes(t)) req.abort();
       else req.continue();
     });
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout: maxTimeout });
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: remaining() });
 
     // Wait for the real page, clicking Turnstile if it appears. Poll, don't sleep blindly.
-    const deadline = Date.now() + maxTimeout;
     let html = "";
     while (Date.now() < deadline) {
       html = await page.content();
@@ -92,7 +99,18 @@ async function solve(url, maxTimeout) {
     const cookies = await page.cookies();
     return { url: page.url(), response: html, userAgent: UA, cookies };
   } finally {
-    await browser.close().catch(() => {});
+    // Graceful close can hang on single-process Chromium under CPU starvation, so
+    // race it and force-kill the browser process if it does not die in 5s.
+    try {
+      await Promise.race([
+        browser.close(),
+        new Promise((r) => setTimeout(r, 5000)),
+      ]);
+    } catch {}
+    try {
+      const proc = browser.process();
+      if (proc && !proc.killed) proc.kill("SIGKILL");
+    } catch {}
   }
 }
 
@@ -101,7 +119,8 @@ const server = http.createServer((req, res) => {
     res.writeHead(code, { "Content-Type": "application/json" });
     res.end(JSON.stringify(obj));
   };
-  if (req.url === "/" || req.url === "/health") return send(200, { status: "ok", busy, mem: memMB() });
+  if (req.url === "/" || req.url === "/health") return send(200, { status: "ok", busy, mem: memMB(), last });
+  if (req.url === "/last") return send(200, { last });
   if (req.method !== "POST" || req.url !== "/v1") return send(404, { error: "not found" });
   let body = "";
   req.on("data", (c) => (body += c));
@@ -117,10 +136,13 @@ const server = http.createServer((req, res) => {
       return send(400, { status: "error", message: "Expected {cmd:'request.get', url}" });
     }
     busy = true;
+    const t0 = Date.now();
     try {
       const solution = await solve(data.url, Math.min(data.maxTimeout || 60000, 120000));
+      last = { at: new Date().toISOString(), url: data.url, ok: true, ms: Date.now() - t0, htmlLen: solution.response.length, title: (solution.response.match(/<title[^>]*>([^<]*)/i) || [])[1] || "" };
       send(200, { status: "ok", solution, mem: memMB() });
     } catch (e) {
+      last = { at: new Date().toISOString(), url: data.url, ok: false, ms: Date.now() - t0, error: String(e.message || e) };
       send(502, { status: "error", message: String(e.message || e) });
     } finally {
       busy = false;
