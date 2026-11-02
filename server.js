@@ -16,8 +16,54 @@ const puppeteer = require("puppeteer-core");
 
 const PORT = process.env.PORT || 8191;
 const CHROME = process.env.CHROME_PATH || "/usr/bin/chromium";
-const UA =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+// No hardcoded UA: the solver reports the browser's own UA, so the UA, JS fingerprint
+// and TLS stack all describe the same browser (a hardcoded Chrome/126 UA on a different
+// Chromium build is itself a detectable mismatch).
+
+// Human-like mouse move: stepped path with a little jitter, not a teleport to the target.
+async function humanMove(page, x, y) {
+  const start = { x: 640, y: 200 };
+  try {
+    const pos = await page.evaluate(() => ({ x: window.scrollX, y: window.scrollY })).catch(() => start);
+    void pos;
+  } catch {}
+  const steps = 18;
+  for (let i = 1; i <= steps; i++) {
+    const t = i / steps;
+    const ease = t * t * (3 - 2 * t);
+    const mx = start.x + (x - start.x) * ease + (Math.random() - 0.5) * 6;
+    const my = start.y + (y - start.y) * ease + (Math.random() - 0.5) * 6;
+    await page.mouse.move(mx, my);
+    await new Promise((r) => setTimeout(r, 30 + Math.random() * 40));
+  }
+}
+
+// Click the Turnstile widget itself. The previous version hunted for a checkbox input
+// inside the cross-origin challenge iframe, which it cannot reliably reach. The widget
+// on the parent page is an <iframe> (src challenges.cloudflare.com) inside a
+// .cf-turnstile container — clicking that element, after scrolling it into view and
+// moving the mouse to it like a human, is how a real visitor passes it.
+async function clickTurnstile(page) {
+  const handles = await page.$$(
+    "iframe[src*='challenges.cloudflare.com'], .cf-turnstile iframe, .cf-turnstile"
+  );
+  for (const h of handles) {
+    try {
+      await h.scrollIntoViewIfNeeded().catch(() => {});
+      const box = await h.boundingBox();
+      if (!box || box.width < 10 || box.height < 10) continue;
+      const cx = box.x + box.width / 2;
+      const cy = box.y + box.height / 2;
+      await humanMove(page, cx, cy);
+      await new Promise((r) => setTimeout(r, 300 + Math.random() * 500));
+      await page.mouse.down();
+      await new Promise((r) => setTimeout(r, 80 + Math.random() * 120));
+      await page.mouse.up();
+      return { clicked: true, at: `${Math.round(cx)},${Math.round(cy)}` };
+    } catch {}
+  }
+  return { clicked: false };
+}
 
 let busy = false;
 // Last solve outcome, kept so a client that disconnects can still read the result via /last.
@@ -57,7 +103,12 @@ async function solve(url, maxTimeout) {
   });
   try {
     const page = await browser.newPage();
-    await page.setUserAgent(UA);
+    // Light stealth patches: hide the automation flags a managed challenge scores on.
+    await page.evaluateOnNewDocument(() => {
+      Object.defineProperty(navigator, "webdriver", { get: () => undefined });
+      Object.defineProperty(navigator, "plugins", { get: () => [1, 2, 3] });
+      window.chrome = window.chrome || { runtime: {} };
+    });
     await page.setRequestInterception(true);
     page.on("request", (req) => {
       const t = req.resourceType();
@@ -67,37 +118,36 @@ async function solve(url, maxTimeout) {
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: remaining() });
 
     // Wait for the real page, clicking Turnstile if it appears. Poll, don't sleep blindly.
+    // Click at most twice: a second click after a few seconds, in case the first landed
+    // before the widget was ready. Diagnostics are attached to the thrown error so /last
+    // shows whether a widget was even found — the key unknown from the last test.
     let html = "";
+    let widgetFound = false;
+    let clickInfo = null;
+    let clicks = 0;
     while (Date.now() < deadline) {
       html = await page.content();
       const isChallenge =
         /just a moment|challenges\.cloudflare|cf-turnstile|cf_chl/i.test(html.slice(0, 8000)) ||
         (await page.$("iframe[src*='challenges.cloudflare.com']").catch(() => null));
       if (!isChallenge) break;
-      // Try to click the Turnstile widget (in its iframe, if reachable).
-      try {
-        const frames = page.frames();
-        for (const f of frames) {
-          if (/challenges\.cloudflare\.com/.test(f.url())) {
-            const box = await f.$("input[type='checkbox'], div[role='checkbox']").catch(() => null);
-            if (box) {
-              const b = await box.boundingBox();
-              if (b) {
-                await page.mouse.move(b.x + b.width / 2, b.y + b.height / 2, { steps: 8 });
-                await box.click();
-              }
-            }
-          }
-        }
-      } catch {}
-      await new Promise((r) => setTimeout(r, 2000));
+      const probe = await page.$$("iframe[src*='challenges.cloudflare.com'], .cf-turnstile").catch(() => []);
+      widgetFound = widgetFound || probe.length > 0;
+      if (clicks < 2) {
+        clickInfo = await clickTurnstile(page).catch(() => ({ clicked: false }));
+        clicks++;
+      }
+      await new Promise((r) => setTimeout(r, 5000));
     }
     html = await page.content();
     if (/just a moment|challenges\.cloudflare/i.test(html.slice(0, 8000))) {
-      throw new Error("Challenge still present after timeout");
+      const e = new Error("Challenge still present after timeout");
+      e.detail = { widgetFound, clicks, clickInfo };
+      throw e;
     }
     const cookies = await page.cookies();
-    return { url: page.url(), response: html, userAgent: UA, cookies };
+    const realUA = await page.evaluate(() => navigator.userAgent).catch(() => "");
+    return { url: page.url(), response: html, userAgent: realUA, cookies };
   } finally {
     // Graceful close can hang on single-process Chromium under CPU starvation, so
     // race it and force-kill the browser process if it does not die in 5s.
@@ -142,7 +192,7 @@ const server = http.createServer((req, res) => {
       last = { at: new Date().toISOString(), url: data.url, ok: true, ms: Date.now() - t0, htmlLen: solution.response.length, title: (solution.response.match(/<title[^>]*>([^<]*)/i) || [])[1] || "" };
       send(200, { status: "ok", solution, mem: memMB() });
     } catch (e) {
-      last = { at: new Date().toISOString(), url: data.url, ok: false, ms: Date.now() - t0, error: String(e.message || e) };
+      last = { at: new Date().toISOString(), url: data.url, ok: false, ms: Date.now() - t0, error: String(e.message || e), detail: e.detail || null };
       send(502, { status: "error", message: String(e.message || e) });
     } finally {
       busy = false;
